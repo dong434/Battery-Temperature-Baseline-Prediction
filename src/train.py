@@ -1,5 +1,8 @@
-﻿import os
+﻿import argparse
+import os
+import random
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import joblib
 import matplotlib
@@ -15,41 +18,75 @@ from model import BatteryTemperatureLSTM
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
+
+CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
 RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
-BEST_MODEL_PATH = os.path.join(RESULTS_DIR, 'best_battery_model.pth')
-LAST_CHECKPOINT_PATH = os.path.join(RESULTS_DIR, 'last_checkpoint.pth')
-BEST_METRIC_PATH = os.path.join(RESULTS_DIR, 'best_val_mse_c.txt')
+TRAIN_VAL_PLOTS_DIR = os.path.join(RESULTS_DIR, 'train_val_plots')
+BEIJING_TZ = ZoneInfo('Asia/Shanghai')
 
 
-def _load_best_metric_from_file(default=float('inf')):
-    if not os.path.exists(BEST_METRIC_PATH):
-        return default
-    try:
-        with open(BEST_METRIC_PATH, 'r', encoding='utf-8') as f:
-            return float(f.read().strip())
-    except Exception:
-        return default
+def _set_seed(seed):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = bool(config.deterministic)
+    torch.backends.cudnn.benchmark = bool(config.cudnn_benchmark)
 
 
-def _save_best_metric_to_file(best_val_mse_c):
-    with open(BEST_METRIC_PATH, 'w', encoding='utf-8') as f:
-        f.write(f'{best_val_mse_c:.12f}')
+def _ensure_dirs():
+    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+    os.makedirs(TRAIN_VAL_PLOTS_DIR, exist_ok=True)
 
 
-def train_model(file_dir=config.data_path,
-                batch_size=config.batch_size,
-                lr=config.lr,
-                epochs=config.epochs,
-                weight_decay=config.weight_decay,
-                scheduler_factor=config.scheduler_factor,
-                scheduler_patience=config.scheduler_patience,
-                scheduler_min_lr=config.scheduler_min_lr,
-                scheduler_threshold=config.scheduler_threshold,
-                scheduler_cooldown=config.scheduler_cooldown,
-                resume_training=True):
+def _find_latest_checkpoint_for_seed(seed):
+    if not os.path.exists(CHECKPOINTS_DIR):
+        return None
+    prefix = f'last_checkpoint_seed{seed}_'
+    candidates = [
+        f for f in os.listdir(CHECKPOINTS_DIR)
+        if f.startswith(prefix) and f.endswith('.pth')
+    ]
+    if not candidates:
+        return None
+    candidates.sort()
+    return os.path.join(CHECKPOINTS_DIR, candidates[-1])
+
+
+def _resolve_seeds(cli_seeds):
+    if cli_seeds:
+        return cli_seeds
+    if hasattr(config, 'seeds') and config.seeds:
+        return [int(s) for s in config.seeds]
+    return [int(config.seed)]
+
+
+def train_model(
+    seed,
+    file_dir=config.data_path,
+    batch_size=config.batch_size,
+    lr=config.lr,
+    epochs=config.epochs,
+    weight_decay=config.weight_decay,
+    scheduler_factor=config.scheduler_factor,
+    scheduler_patience=config.scheduler_patience,
+    scheduler_min_lr=config.scheduler_min_lr,
+    scheduler_threshold=config.scheduler_threshold,
+    scheduler_cooldown=config.scheduler_cooldown,
+    resume_training=False,
+):
+    _set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    _ensure_dirs()
 
-    print('开始加载')
+    run_id = datetime.now(BEIJING_TZ).strftime('%Y%m%d_%H%M%S')
+    best_model_path = os.path.join(CHECKPOINTS_DIR, f'best_model_seed{seed}_{run_id}.pth')
+    last_checkpoint_path = os.path.join(CHECKPOINTS_DIR, f'last_checkpoint_seed{seed}_{run_id}.pth')
+
+    print(f'开始加载 (seed={seed})')
     x_train_path = os.path.join(file_dir, 'train_x.pt')
     y_train_path = os.path.join(file_dir, 'train_y.pt')
     x_val_path = os.path.join(file_dir, 'evaluate_x.pt')
@@ -70,7 +107,14 @@ def train_model(file_dir=config.data_path,
     y_scaler = joblib.load(scaler_path)['y_scaler']
 
     train_dataset = TensorDataset(x_train, y_train)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_generator = torch.Generator()
+    train_generator.manual_seed(seed)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=train_generator,
+    )
     val_dataset = TensorDataset(x_val, y_val)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
@@ -85,26 +129,22 @@ def train_model(file_dir=config.data_path,
         patience=scheduler_patience,
         threshold=scheduler_threshold,
         cooldown=scheduler_cooldown,
-        min_lr=scheduler_min_lr
+        min_lr=scheduler_min_lr,
     )
 
-    if not os.path.exists(RESULTS_DIR):
-        os.makedirs(RESULTS_DIR)
-    run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-
     start_epoch = 0
-    best_val_mse_c = _load_best_metric_from_file(default=float('inf'))
+    best_val_mse_c = float('inf')
 
-    if resume_training and os.path.exists(LAST_CHECKPOINT_PATH):
-        checkpoint = torch.load(LAST_CHECKPOINT_PATH, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = int(checkpoint.get('epoch', 0))
-        best_val_mse_c = float(checkpoint.get('best_val_mse_c', best_val_mse_c))
-        print(f'已恢复上次训练: start_epoch={start_epoch}, best_val_mse_c={best_val_mse_c:.6f}')
-    else:
-        print(f'从头开始训练: best_val_mse_c={best_val_mse_c:.6f}')
+    if resume_training:
+        latest_ckpt = _find_latest_checkpoint_for_seed(seed)
+        if latest_ckpt is not None:
+            checkpoint = torch.load(latest_ckpt, map_location=device, weights_only=False)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = int(checkpoint.get('epoch', 0))
+            best_val_mse_c = float(checkpoint.get('best_val_mse_c', best_val_mse_c))
+            print(f'已恢复训练: checkpoint={os.path.basename(latest_ckpt)}, start_epoch={start_epoch}')
 
     train_losses_scaled = []
     val_losses_scaled = []
@@ -159,47 +199,44 @@ def train_model(file_dir=config.data_path,
 
         if val_mse_c < best_val_mse_c:
             best_val_mse_c = val_mse_c
-            torch.save(model.state_dict(), BEST_MODEL_PATH)
-            _save_best_metric_to_file(best_val_mse_c)
-            print(f'全局最优更新: epoch={global_epoch}, best_val_mse_c={best_val_mse_c:.6f}')
+            torch.save(model.state_dict(), best_model_path)
+            print(f'本次最优更新(seed={seed}): epoch={global_epoch}, val_mse_c={best_val_mse_c:.6f}')
 
-        # Save resumable training state every epoch.
         torch.save(
             {
                 'epoch': global_epoch,
+                'seed': seed,
+                'run_id': run_id,
                 'best_val_mse_c': best_val_mse_c,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
             },
-            LAST_CHECKPOINT_PATH,
+            last_checkpoint_path,
         )
 
         prev_lr = optimizer.param_groups[0]['lr']
         scheduler.step(val_mse_c)
         current_lr = optimizer.param_groups[0]['lr']
-        lr_changed = current_lr < prev_lr
+        if current_lr < prev_lr:
+            print(f'学习率衰减触发(seed={seed}): {prev_lr:.6f} -> {current_lr:.6f}')
 
         if global_epoch % 5 == 0:
             print(
-                f'Epoch:{global_epoch} '
+                f'Seed:{seed} Epoch:{global_epoch} '
                 f'train_loss_scaled:{train_avg_loss_scaled:.6f} '
                 f'val_loss_scaled:{val_avg_loss_scaled:.6f} '
                 f'val_mse_c:{val_mse_c:.4f} '
                 f'best_val_mse_c:{best_val_mse_c:.4f} '
                 f'lr:{current_lr:.6f}'
             )
-        if lr_changed:
-            print(f'学习率衰减触发: {prev_lr:.6f} -> {current_lr:.6f}')
-
-    print('训练完成')
 
     plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
     plt.plot(train_losses_scaled, 'r-', label='train_loss_scaled')
     plt.plot(val_losses_scaled, 'b--', label='val_loss_scaled')
-    plt.title('Scaled Loss Curve', fontsize=12)
+    plt.title(f'Scaled Loss Curve (seed={seed})', fontsize=12)
     plt.xlabel('local epochs', fontsize=11)
     plt.ylabel('loss', fontsize=11)
     plt.grid(True, linestyle='--', alpha=0.7)
@@ -207,18 +244,64 @@ def train_model(file_dir=config.data_path,
 
     plt.subplot(1, 2, 2)
     plt.plot(val_mse_c_list, 'g-', label='val_mse_c')
-    plt.title('Unscaled Loss Curve (Celsius MSE)', fontsize=12)
+    plt.title(f'Unscaled Loss Curve (seed={seed})', fontsize=12)
     plt.xlabel('local epochs', fontsize=11)
     plt.ylabel('mse (Celsius^2)', fontsize=11)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
 
-    curve_name = f'train_loss_curve_{run_id}.png'
+    curve_name = f'train_val_seed{seed}_{run_id}.png'
+    curve_path = os.path.join(TRAIN_VAL_PLOTS_DIR, curve_name)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, curve_name), dpi=300, bbox_inches='tight')
-    print(f'loss 曲线已保存为 {curve_name}')
-    print(f'当前全局最优验证MSE(℃^2): {best_val_mse_c:.6f}')
+    plt.savefig(curve_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f'训练完成(seed={seed})')
+    print(f'本次最佳模型: {best_model_path}')
+    print(f'本次最后断点: {last_checkpoint_path}')
+    print(f'train/val 曲线: {curve_path}')
+
+    return {
+        'seed': seed,
+        'best_model_path': best_model_path,
+        'last_checkpoint_path': last_checkpoint_path,
+        'best_val_mse_c': best_val_mse_c,
+        'curve_path': curve_path,
+    }
+
+
+def run_multi_seed(seeds, resume_training=False):
+    print(f'即将运行多种子训练: {seeds}')
+    results = []
+    for seed in seeds:
+        results.append(train_model(seed=seed, resume_training=resume_training))
+
+    print('多种子训练完成，汇总如下:')
+    for item in results:
+        print(
+            f"seed={item['seed']} best_val_mse_c={item['best_val_mse_c']:.6f} "
+            f"best_model={item['best_model_path']}"
+        )
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description='Train model with single seed or multiple seeds.')
+    parser.add_argument(
+        '--seeds',
+        type=int,
+        nargs='*',
+        default=None,
+        help='可选，多种子列表，例如: --seeds 42 123 2024',
+    )
+    parser.add_argument(
+        '--resume_training',
+        action='store_true',
+        help='按种子恢复最近 last_checkpoint_seed{seed}_*.pth 继续训练',
+    )
+    return parser.parse_args()
 
 
 if __name__ == '__main__':
-    train_model(resume_training=False)
+    args = _parse_args()
+    seeds = _resolve_seeds(args.seeds)
+    run_multi_seed(seeds=seeds, resume_training=args.resume_training)

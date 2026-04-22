@@ -17,9 +17,9 @@ def load_data(file_path, target_battery='B0005'):
     cycles = mat[target_battery][0, 0]['cycle'][0]
 
     data_list = []
-    V_MAX = 4.2
-    C_INITIAL = 2.0
-    T_ENV = 24.0
+    v_max = 4.2
+    c_initial = 2.0
+    t_env = 24.0
 
     for i, cycle in enumerate(cycles):
         cycle_type = cycle['type'][0]
@@ -32,20 +32,22 @@ def load_data(file_path, target_battery='B0005'):
             time = cycle_data['Time'][0]
             capacity = float(cycle_data['Capacity'][0, 0])
 
-            soh = capacity / C_INITIAL
+            soh = capacity / c_initial
 
             for j in range(len(voltage_measured)):
-                p_loss = abs(current_measured[j]) * (V_MAX - voltage_measured[j])
+                p_loss = abs(current_measured[j]) * (v_max - voltage_measured[j])
 
-                data_list.append({
-                    'cycle': i + 1,
-                    'voltage_measured': voltage_measured[j],
-                    'P_loss': p_loss,
-                    'time': time[j],
-                    'ambient_temp': T_ENV,
-                    'SOH': soh,
-                    'temperature_measured': temperature_measured[j],
-                })
+                data_list.append(
+                    {
+                        'cycle': i + 1,
+                        'voltage_measured': voltage_measured[j],
+                        'P_loss': p_loss,
+                        'time': time[j],
+                        'ambient_temp': t_env,
+                        'SOH': soh,
+                        'temperature_measured': temperature_measured[j],
+                    }
+                )
 
     return pd.DataFrame(data_list)
 
@@ -98,22 +100,36 @@ def create_sequence(features, labels, cycles, sequence_len=30):
     return x_tensor, y_tensor
 
 
-def split_tail_cycles(df, val_ratio_min=0.15, val_ratio_max=0.20):
+def split_tail_cycles_range(df, ratio_min=0.15, ratio_max=0.20):
     unique_cycles = np.sort(df['cycle'].unique())
     cycle_count = len(unique_cycles)
     if cycle_count < 2:
         raise ValueError('每个电池至少需要 2 个放电周期，才能切分训练集和验证集')
 
-    min_val_count = int(np.ceil(cycle_count * val_ratio_min))    #向上取整，验证集数据最少取cycle_count * val_ratio_min个cycle
-    max_val_count = int(np.floor(cycle_count * val_ratio_max))   #向下取整，验证集数据多取cycle_count * val_ratio_max个cycle
-    val_count = max(min_val_count, max_val_count)
-    val_count = max(1, min(val_count, cycle_count - 1))
+    min_val_count = int(np.ceil(cycle_count * ratio_min))
+    max_val_count = int(np.floor(cycle_count * ratio_max))
+    tail_count = max(min_val_count, max_val_count)
+    tail_count = max(1, min(tail_count, cycle_count - 1))
 
-    val_cycles = unique_cycles[-val_count:]
-    is_val = df['cycle'].isin(val_cycles)
-    train_df = df.loc[~is_val].copy()
-    val_df = df.loc[is_val].copy()
-    return train_df, val_df, cycle_count, val_count
+    tail_cycles = unique_cycles[-tail_count:]
+    is_tail = df['cycle'].isin(tail_cycles)
+    front_df = df.loc[~is_tail].copy()
+    tail_df = df.loc[is_tail].copy()
+    return front_df, tail_df, cycle_count, tail_count
+
+
+def split_tail_cycles_ratio(df, ratio=0.15):
+    unique_cycles = np.sort(df['cycle'].unique())
+    cycle_count = len(unique_cycles)
+    if cycle_count < 1:
+        raise ValueError('未找到可用周期')
+
+    tail_count = int(np.ceil(cycle_count * ratio))
+    tail_count = max(1, min(tail_count, cycle_count))
+
+    tail_cycles = unique_cycles[-tail_count:]
+    tail_df = df.loc[df['cycle'].isin(tail_cycles)].copy()
+    return tail_df, cycle_count, tail_count
 
 
 def add_cycle_offset(df, cycle_offset):
@@ -136,10 +152,10 @@ def build_train_val_from_batteries(
     for battery_id in battery_ids:
         file_path = os.path.join(PROJECT_ROOT, 'data', 'raw', f'{battery_id}.mat')
         battery_df = load_data(file_path, target_battery=battery_id)
-        battery_train_df, battery_val_df, cycle_count, val_count = split_tail_cycles(
+        battery_train_df, battery_val_df, cycle_count, val_count = split_tail_cycles_range(
             battery_df,
-            val_ratio_min=val_ratio_min,
-            val_ratio_max=val_ratio_max,
+            ratio_min=val_ratio_min,
+            ratio_max=val_ratio_max,
         )
 
         battery_train_df, cycle_offset = add_cycle_offset(battery_train_df, cycle_offset)
@@ -178,6 +194,27 @@ def build_train_val_from_batteries(
     return train_x_tensor, train_y_tensor, val_x_tensor, val_y_tensor, x_scaler, y_scaler
 
 
+def build_test_from_battery(test_battery, test_ratio, sequence_len, x_scaler, y_scaler):
+    file_path = os.path.join(PROJECT_ROOT, 'data', 'raw', f'{test_battery}.mat')
+    test_df_full = load_data(file_path, target_battery=test_battery)
+    test_df, cycle_count, test_count = split_tail_cycles_ratio(test_df_full, ratio=test_ratio)
+    print(f'{test_battery}: total_cycles={cycle_count}, test_cycles={test_count}')
+
+    test_x, test_y, _, _, test_cycles = clean_data(
+        test_df,
+        x_scaler=x_scaler,
+        y_scaler=y_scaler,
+        fit=False,
+    )
+    test_x_tensor, test_y_tensor = create_sequence(
+        test_x,
+        test_y,
+        test_cycles,
+        sequence_len=sequence_len,
+    )
+    return test_x_tensor, test_y_tensor
+
+
 def save_processed_train_data(X, y, x_scaler, y_scaler, save_name_x, save_name_y, save_name_scaler, save_dir=None):
     if save_dir is None:
         save_dir = os.path.join(PROJECT_ROOT, 'data', 'processed')
@@ -189,14 +226,14 @@ def save_processed_train_data(X, y, x_scaler, y_scaler, save_name_x, save_name_y
     print('训练集 数据保存完成')
 
 
-def save_processed_vAt_data(X, y, save_name_x, save_name_y, save_dir=None):
+def save_processed_split_data(X, y, save_name_x, save_name_y, save_dir=None):
     if save_dir is None:
         save_dir = os.path.join(PROJECT_ROOT, 'data', 'processed')
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     torch.save(X, os.path.join(save_dir, save_name_x))
     torch.save(y, os.path.join(save_dir, save_name_y))
-    print('验证/测试集 数据保存完成')
+    print(f'{save_name_x}/{save_name_y} 保存完成')
 
 
 if __name__ == '__main__':
@@ -207,16 +244,40 @@ if __name__ == '__main__':
         sequence_len=config.sequence_len,
     )
 
+    test_x_tensor, test_y_tensor = build_test_from_battery(
+        test_battery=config.test_battery,
+        test_ratio=config.test_cycle_ratio,
+        sequence_len=config.sequence_len,
+        x_scaler=x_scaler,
+        y_scaler=y_scaler,
+    )
+
     print(f'train X shape: {train_x_tensor.shape}')
     print(f'train y shape: {train_y_tensor.shape}')
-
     save_processed_train_data(
-        train_x_tensor, train_y_tensor, x_scaler, y_scaler,
-        save_name_x='train_x.pt', save_name_y='train_y.pt', save_name_scaler='train_scaler.gz'
+        train_x_tensor,
+        train_y_tensor,
+        x_scaler,
+        y_scaler,
+        save_name_x='train_x.pt',
+        save_name_y='train_y.pt',
+        save_name_scaler='train_scaler.gz',
     )
 
     print(f'eval X shape: {eval_x_tensor.shape}')
     print(f'eval y shape: {eval_y_tensor.shape}')
-    save_processed_vAt_data(
-        eval_x_tensor, eval_y_tensor, save_name_x='evaluate_x.pt', save_name_y='evaluate_y.pt'
+    save_processed_split_data(
+        eval_x_tensor,
+        eval_y_tensor,
+        save_name_x='evaluate_x.pt',
+        save_name_y='evaluate_y.pt',
+    )
+
+    print(f'test X shape: {test_x_tensor.shape}')
+    print(f'test y shape: {test_y_tensor.shape}')
+    save_processed_split_data(
+        test_x_tensor,
+        test_y_tensor,
+        save_name_x='test_x.pt',
+        save_name_y='test_y.pt',
     )
