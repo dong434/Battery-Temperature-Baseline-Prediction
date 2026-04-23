@@ -7,11 +7,13 @@ epochs = 100
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 data_path = os.path.join(_BASE_DIR, '..', 'data', 'processed')
 
-# 复现控制
-seed = 42
-seeds = [42]
+# 复现控制（单一种子）
+seed = 3407
 deterministic = True
 cudnn_benchmark = False
+
+# 训练稳定性
+grad_clip_max_norm = 1.0
 
 # 学习率衰减参数
 scheduler_factor = 0.8
@@ -32,4 +34,3 @@ input_size = 5
 hidden_size = 128
 num_layers = 2
 dropout = 0.3
-

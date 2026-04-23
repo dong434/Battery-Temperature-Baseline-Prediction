@@ -10,7 +10,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import config
@@ -25,6 +24,7 @@ BEIJING_TZ = ZoneInfo('Asia/Shanghai')
 
 
 def _set_seed(seed=config.seed):
+    # 固定随机性，保证评估可复现
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -39,10 +39,7 @@ def _set_seed(seed=config.seed):
 def _find_latest_best_model():
     if not os.path.exists(CHECKPOINTS_DIR):
         return None
-    candidates = [
-        f for f in os.listdir(CHECKPOINTS_DIR)
-        if f.startswith('best_model_') and f.endswith('.pth')
-    ]
+    candidates = [f for f in os.listdir(CHECKPOINTS_DIR) if f.startswith('best_model_') and f.endswith('.pth')]
     if not candidates:
         return None
     candidates.sort()
@@ -54,6 +51,7 @@ def _compute_metrics(preds_c, targets_c, eps=1e-6):
     abs_errors = np.abs(errors)
 
     mae_c = float(np.mean(abs_errors))
+    max_ae_c = float(np.max(abs_errors))
     mre = float(np.mean(abs_errors / np.maximum(np.abs(targets_c), eps)))
 
     ss_res = float(np.sum((targets_c - preds_c) ** 2))
@@ -61,7 +59,42 @@ def _compute_metrics(preds_c, targets_c, eps=1e-6):
     ss_tot = float(np.sum((targets_c - mean_target) ** 2))
     r2 = float('nan') if ss_tot <= eps else float(1.0 - ss_res / ss_tot)
 
-    return mae_c, mre, r2
+    return mae_c, max_ae_c, mre, r2
+
+
+def _save_metrics_table(fig_path, mae_c, max_ae_c, mre, r2):
+    # 按表格风格输出评估结果，不画曲线
+    fig, ax = plt.subplots(figsize=(8.5, 3.2), dpi=220)
+    ax.axis('off')
+
+    headers = ['Case #', 'MAE (°C)', 'MAX AE (°C)', 'MRE (%)', 'R2']
+    row = ['1', f'{mae_c:.4f}', f'{max_ae_c:.4f}', f'{mre * 100:.4f}', f'{r2:.4f}']
+
+    table = ax.table(
+        cellText=[row],
+        colLabels=headers,
+        cellLoc='center',
+        colLoc='center',
+        loc='center'
+    )
+
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1.15, 1.9)
+
+    for (r, c), cell in table.get_celld().items():
+        cell.set_edgecolor('black')
+        cell.set_linewidth(1.0)
+        if r == 0:
+            cell.set_facecolor('#D9D9D9')
+            cell.set_text_props(weight='bold')
+        else:
+            cell.set_facecolor('#F2F2F2')
+
+    ax.set_title('Test Metrics Table', fontsize=14, weight='bold', pad=12)
+    fig.tight_layout()
+    fig.savefig(fig_path, bbox_inches='tight')
+    plt.close(fig)
 
 
 def evaluate_model(model_path=None, batch_size=config.batch_size):
@@ -94,18 +127,13 @@ def evaluate_model(model_path=None, batch_size=config.batch_size):
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
 
-    criterion = nn.MSELoss()
     preds_scaled = []
     targets_scaled = []
-
     with torch.no_grad():
         for batch_x, batch_y in test_loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device).view(-1, 1)
-
             output = model(batch_x)
-            _ = criterion(output, batch_y)
-
             preds_scaled.append(output.cpu().numpy())
             targets_scaled.append(batch_y.cpu().numpy())
 
@@ -115,53 +143,23 @@ def evaluate_model(model_path=None, batch_size=config.batch_size):
     preds_c = y_scaler.inverse_transform(preds_scaled)
     targets_c = y_scaler.inverse_transform(targets_scaled)
 
-    mae_c, mre, r2 = _compute_metrics(preds_c, targets_c)
-
-    sample_scaled_sqerr = ((preds_scaled - targets_scaled) ** 2).flatten()
-    diff_c = (preds_c - targets_c).flatten()
+    mae_c, max_ae_c, mre, r2 = _compute_metrics(preds_c, targets_c)
 
     run_id = datetime.now(BEIJING_TZ).strftime('%Y%m%d_%H%M%S')
     fig_path = os.path.join(TEST_PLOTS_DIR, f'test_eval_{run_id}.png')
-
-    plt.figure(figsize=(18, 5))
-
-    plt.subplot(1, 3, 1)
-    plt.plot(sample_scaled_sqerr, color='tab:blue', linewidth=1.0)
-    plt.title('Scaled Squared Error (sample-wise)')
-    plt.xlabel('sample index')
-    plt.ylabel('squared error')
-    plt.grid(True, linestyle='--', alpha=0.5)
-
-    plt.subplot(1, 3, 2)
-    plt.plot(targets_c.flatten(), label='true_temp_c', color='tab:green', linewidth=1.1)
-    plt.plot(preds_c.flatten(), label='pred_temp_c', color='tab:red', linewidth=1.0, alpha=0.85)
-    plt.title('True vs Predicted Temperature (C)')
-    plt.xlabel('sample index')
-    plt.ylabel('temperature (C)')
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend()
-
-    plt.subplot(1, 3, 3)
-    plt.plot(diff_c, label='pred-true (C)', color='tab:orange', linewidth=1.0)
-    plt.axhline(0.0, color='black', linewidth=0.8)
-    plt.title('Prediction Error in Celsius')
-    plt.xlabel('sample index')
-    plt.ylabel('delta temp (C)')
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+    _save_metrics_table(fig_path, mae_c, max_ae_c, mre, r2)
 
     print(f'模型路径: {model_path}')
     print(f'平均绝对预测误差 MAE(℃): {mae_c:.6f}')
+    print(f'最大绝对预测误差 MAX AE(℃): {max_ae_c:.6f}')
     print(f'平均相对预测误差 MRE(%): {mre * 100:.4f}%')
     print(f'R2: {r2:.6f}')
-    print(f'测试图已保存: {fig_path}')
+    print(f'测试表格图已保存: {fig_path}')
 
     return {
         'model_path': model_path,
         'mae_c': mae_c,
+        'max_ae_c': max_ae_c,
         'mre': mre,
         'r2': r2,
         'figure_path': fig_path,

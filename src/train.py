@@ -1,5 +1,4 @@
-﻿import argparse
-import os
+﻿import os
 import random
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -56,16 +55,8 @@ def _find_latest_checkpoint_for_seed(seed):
     return os.path.join(CHECKPOINTS_DIR, candidates[-1])
 
 
-def _resolve_seeds(cli_seeds):
-    if cli_seeds:
-        return cli_seeds
-    if hasattr(config, 'seeds') and config.seeds:
-        return [int(s) for s in config.seeds]
-    return [int(config.seed)]
-
-
 def train_model(
-    seed,
+    seed=config.seed,
     file_dir=config.data_path,
     batch_size=config.batch_size,
     lr=config.lr,
@@ -109,12 +100,7 @@ def train_model(
     train_dataset = TensorDataset(x_train, y_train)
     train_generator = torch.Generator()
     train_generator.manual_seed(seed)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        generator=train_generator,
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=train_generator)
     val_dataset = TensorDataset(x_val, y_val)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
@@ -133,7 +119,7 @@ def train_model(
     )
 
     start_epoch = 0
-    best_val_mse_c = float('inf')
+    best_val_mae_c = float('inf')
 
     if resume_training:
         latest_ckpt = _find_latest_checkpoint_for_seed(seed)
@@ -143,12 +129,12 @@ def train_model(
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = int(checkpoint.get('epoch', 0))
-            best_val_mse_c = float(checkpoint.get('best_val_mse_c', best_val_mse_c))
+            best_val_mae_c = float(checkpoint.get('best_val_mae_c', best_val_mae_c))
             print(f'已恢复训练: checkpoint={os.path.basename(latest_ckpt)}, start_epoch={start_epoch}')
 
     train_losses_scaled = []
     val_losses_scaled = []
-    val_mse_c_list = []
+    val_mae_c_list = []
 
     for local_epoch in range(1, epochs + 1):
         global_epoch = start_epoch + local_epoch
@@ -167,6 +153,7 @@ def train_model(
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.grad_clip_max_norm)
             optimizer.step()
 
             train_running_loss += loss.item()
@@ -191,23 +178,23 @@ def train_model(
         val_targets_scaled = np.concatenate(val_targets_scaled, axis=0)
         val_preds_c = y_scaler.inverse_transform(val_preds_scaled)
         val_targets_c = y_scaler.inverse_transform(val_targets_scaled)
-        val_mse_c = float(np.mean((val_preds_c - val_targets_c) ** 2))
+        val_mae_c = float(np.mean(np.abs(val_preds_c - val_targets_c)))
 
         train_losses_scaled.append(train_avg_loss_scaled)
         val_losses_scaled.append(val_avg_loss_scaled)
-        val_mse_c_list.append(val_mse_c)
+        val_mae_c_list.append(val_mae_c)
 
-        if val_mse_c < best_val_mse_c:
-            best_val_mse_c = val_mse_c
+        if val_mae_c < best_val_mae_c:
+            best_val_mae_c = val_mae_c
             torch.save(model.state_dict(), best_model_path)
-            print(f'本次最优更新(seed={seed}): epoch={global_epoch}, val_mse_c={best_val_mse_c:.6f}')
+            print(f'本次最优更新(seed={seed}): epoch={global_epoch}, best_val_mae_c={best_val_mae_c:.6f}')
 
         torch.save(
             {
                 'epoch': global_epoch,
                 'seed': seed,
                 'run_id': run_id,
-                'best_val_mse_c': best_val_mse_c,
+                'best_val_mae_c': best_val_mae_c,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
@@ -216,18 +203,18 @@ def train_model(
         )
 
         prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_mse_c)
+        scheduler.step(val_mae_c)
         current_lr = optimizer.param_groups[0]['lr']
         if current_lr < prev_lr:
             print(f'学习率衰减触发(seed={seed}): {prev_lr:.6f} -> {current_lr:.6f}')
 
         if global_epoch % 5 == 0:
             print(
-                f'Seed:{seed} Epoch:{global_epoch} '
+                f'Epoch:{global_epoch} '
                 f'train_loss_scaled:{train_avg_loss_scaled:.6f} '
                 f'val_loss_scaled:{val_avg_loss_scaled:.6f} '
-                f'val_mse_c:{val_mse_c:.4f} '
-                f'best_val_mse_c:{best_val_mse_c:.4f} '
+                f'val_mae_c:{val_mae_c:.4f} '
+                f'best_val_mae_c:{best_val_mae_c:.4f} '
                 f'lr:{current_lr:.6f}'
             )
 
@@ -243,10 +230,10 @@ def train_model(
     plt.legend()
 
     plt.subplot(1, 2, 2)
-    plt.plot(val_mse_c_list, 'g-', label='val_mse_c')
-    plt.title(f'Unscaled Loss Curve (seed={seed})', fontsize=12)
+    plt.plot(val_mae_c_list, 'g-', label='val_mae_c')
+    plt.title(f'Unscaled MAE Curve (seed={seed})', fontsize=12)
     plt.xlabel('local epochs', fontsize=11)
-    plt.ylabel('mse (Celsius^2)', fontsize=11)
+    plt.ylabel('mae (Celsius)', fontsize=11)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
 
@@ -261,47 +248,6 @@ def train_model(
     print(f'本次最后断点: {last_checkpoint_path}')
     print(f'train/val 曲线: {curve_path}')
 
-    return {
-        'seed': seed,
-        'best_model_path': best_model_path,
-        'last_checkpoint_path': last_checkpoint_path,
-        'best_val_mse_c': best_val_mse_c,
-        'curve_path': curve_path,
-    }
-
-
-def run_multi_seed(seeds, resume_training=False):
-    print(f'即将运行多种子训练: {seeds}')
-    results = []
-    for seed in seeds:
-        results.append(train_model(seed=seed, resume_training=resume_training))
-
-    print('多种子训练完成，汇总如下:')
-    for item in results:
-        print(
-            f"seed={item['seed']} best_val_mse_c={item['best_val_mse_c']:.6f} "
-            f"best_model={item['best_model_path']}"
-        )
-
-
-def _parse_args():
-    parser = argparse.ArgumentParser(description='Train model with single seed or multiple seeds.')
-    parser.add_argument(
-        '--seeds',
-        type=int,
-        nargs='*',
-        default=None,
-        help='可选，多种子列表，例如: --seeds 42 123 2024',
-    )
-    parser.add_argument(
-        '--resume_training',
-        action='store_true',
-        help='按种子恢复最近 last_checkpoint_seed{seed}_*.pth 继续训练',
-    )
-    return parser.parse_args()
-
 
 if __name__ == '__main__':
-    args = _parse_args()
-    seeds = _resolve_seeds(args.seeds)
-    run_multi_seed(seeds=seeds, resume_training=args.resume_training)
+    train_model(seed=config.seed, resume_training=False)
