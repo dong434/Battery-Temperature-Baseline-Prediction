@@ -17,3 +17,13 @@ python src/data_pipeline.py
 python src/train.py
 python src/evaluate.py
 ```
+
+## 当前数据集划分
+- 训练集：`B0005`、`B0006`
+- 验证集：`B0007`
+- 测试集：`B0018`
+
+## 当前建模说明
+- 主输入特征：`voltage_measured`、`time`、`ambient_temp`、`SOH`
+- 训练目标：使用长度为 `30` 的时间窗口，预测窗口最后一个时刻的温度
+- PINN 辅助量：预处理阶段会额外保存窗口末步的 `current / voltage / ambient / time / SOC / SOH`

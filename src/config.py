@@ -24,13 +24,16 @@ scheduler_cooldown = 1
 
 batch_size = 256
 sequence_len = 30
-train_batteries = ['B0005', 'B0006', 'B0007']
-val_cycle_ratio_min = 0.15
-val_cycle_ratio_max = 0.20
-test_battery = 'B0018'
-test_cycle_ratio = 0.15
+train_batteries = ['B0005', 'B0006']
+val_batteries = ['B0007']
+test_batteries = ['B0018']
 
-input_size = 5
+input_size = 4
 hidden_size = 128
 num_layers = 2
 dropout = 0.3
+
+pinn_gamma = 0.9
+ocv_min = 2.5
+ocv_max = 4.3
+ocv_hidden_size = 32

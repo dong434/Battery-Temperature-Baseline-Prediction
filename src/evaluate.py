@@ -167,7 +167,7 @@ def evaluate_model(model_path=None, batch_size=config.batch_size):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Evaluate model on test set (B0018 tail cycles).')
+    parser = argparse.ArgumentParser(description='Evaluate model on the configured test batteries.')
     parser.add_argument('--model_path', type=str, default=None, help='可选，手动指定模型路径')
     args = parser.parse_args()
     evaluate_model(model_path=args.model_path)
