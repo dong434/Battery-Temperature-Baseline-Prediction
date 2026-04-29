@@ -1,4 +1,3 @@
-﻿import argparse
 import os
 import random
 from datetime import datetime
@@ -11,6 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, TensorDataset
 
 import config
@@ -23,6 +23,7 @@ CHECKPOINTS_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
 RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
 TRAIN_VAL_PLOTS_DIR = os.path.join(RESULTS_DIR, 'train_val_plots')
 BEIJING_TZ = ZoneInfo('Asia/Shanghai')
+TIME_FEATURE_INDEX = 1
 
 
 def _set_seed(seed):
@@ -56,16 +57,36 @@ def _find_latest_checkpoint_for_seed(seed):
     return os.path.join(CHECKPOINTS_DIR, candidates[-1])
 
 
-def _resolve_seeds(cli_seeds):
-    if cli_seeds:
-        return cli_seeds
-    if hasattr(config, 'seeds') and config.seeds:
-        return [int(s) for s in config.seeds]
-    return [int(config.seed)]
+def _load_split_tensors(file_dir, split_name):
+    x = torch.load(os.path.join(file_dir, f'{split_name}_x.pt'), weights_only=True)
+    y = torch.load(os.path.join(file_dir, f'{split_name}_y.pt'), weights_only=True)
+    current = torch.load(os.path.join(file_dir, f'{split_name}_current_last.pt'), weights_only=True)
+    voltage = torch.load(os.path.join(file_dir, f'{split_name}_voltage_last.pt'), weights_only=True)
+    ambient = torch.load(os.path.join(file_dir, f'{split_name}_ambient_last.pt'), weights_only=True)
+    time_last = torch.load(os.path.join(file_dir, f'{split_name}_time_last.pt'), weights_only=True)
+    soc = torch.load(os.path.join(file_dir, f'{split_name}_soc_last.pt'), weights_only=True)
+    soh = torch.load(os.path.join(file_dir, f'{split_name}_soh_last.pt'), weights_only=True)
+    return x, y, current, voltage, ambient, time_last, soc, soh
+
+
+def _compute_alpha(loss_r, loss_f, params, alpha_prev, eps=1e-8):
+    loss_r_grads = torch.autograd.grad(loss_r, params, retain_graph=True, allow_unused=True)
+    loss_f_grads = torch.autograd.grad(loss_f, params, retain_graph=True, allow_unused=True)
+
+    loss_r_abs = [grad.detach().abs().reshape(-1) for grad in loss_r_grads if grad is not None]
+    loss_f_abs = [grad.detach().abs().reshape(-1) for grad in loss_f_grads if grad is not None]
+    if not loss_r_abs or not loss_f_abs:
+        return alpha_prev.detach()
+
+    max_grad_r = torch.max(torch.cat(loss_r_abs))
+    mean_grad_f = torch.mean(torch.cat(loss_f_abs))
+    alpha_hat = max_grad_r / mean_grad_f.clamp_min(eps)
+    alpha = (1.0 - config.pinn_gamma) * alpha_prev + config.pinn_gamma * alpha_hat
+    return alpha.detach()
 
 
 def train_model(
-    seed,
+    seed=config.seed,
     file_dir=config.data_path,
     batch_size=config.batch_size,
     lr=config.lr,
@@ -87,38 +108,28 @@ def train_model(
     last_checkpoint_path = os.path.join(CHECKPOINTS_DIR, f'last_checkpoint_seed{seed}_{run_id}.pth')
 
     print(f'开始加载 (seed={seed})')
-    x_train_path = os.path.join(file_dir, 'train_x.pt')
-    y_train_path = os.path.join(file_dir, 'train_y.pt')
-    x_val_path = os.path.join(file_dir, 'evaluate_x.pt')
-    y_val_path = os.path.join(file_dir, 'evaluate_y.pt')
     scaler_path = os.path.join(file_dir, 'train_scaler.gz')
-
-    if not os.path.exists(x_train_path) or not os.path.exists(y_train_path):
-        raise FileNotFoundError(f'训练张量数据未找到: {x_train_path}, {y_train_path}')
-    if not os.path.exists(x_val_path) or not os.path.exists(y_val_path):
-        raise FileNotFoundError(f'验证张量数据未找到: {x_val_path}, {y_val_path}')
     if not os.path.exists(scaler_path):
         raise FileNotFoundError(f'训练集 scaler 未找到: {scaler_path}')
 
-    x_train = torch.load(x_train_path, weights_only=True)
-    y_train = torch.load(y_train_path, weights_only=True)
-    x_val = torch.load(x_val_path, weights_only=True)
-    y_val = torch.load(y_val_path, weights_only=True)
-    y_scaler = joblib.load(scaler_path)['y_scaler']
+    train_tensors = _load_split_tensors(file_dir, 'train')
+    val_tensors = _load_split_tensors(file_dir, 'evaluate')
+    scalers = joblib.load(scaler_path)
+    y_scaler = scalers['y_scaler']
+    x_scaler = scalers['x_scaler']
+    y_range = float(y_scaler.data_max_[0] - y_scaler.data_min_[0])
+    time_range = float(x_scaler.data_max_[TIME_FEATURE_INDEX] - x_scaler.data_min_[TIME_FEATURE_INDEX])
+    if time_range <= 0:
+        raise ValueError('时间特征缩放范围必须大于 0，才能计算 dT/dt')
 
-    train_dataset = TensorDataset(x_train, y_train)
+    train_dataset = TensorDataset(*train_tensors)
     train_generator = torch.Generator()
     train_generator.manual_seed(seed)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        generator=train_generator,
-    )
-    val_dataset = TensorDataset(x_val, y_val)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, generator=train_generator)
+    val_dataset = TensorDataset(*val_tensors)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    input_size = x_train.shape[-1]
+    input_size = train_tensors[0].shape[-1]
     model = BatteryTemperatureLSTM(input_size=input_size).to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -133,7 +144,8 @@ def train_model(
     )
 
     start_epoch = 0
-    best_val_mse_c = float('inf')
+    best_val_mae_c = float('inf')
+    alpha_state = torch.tensor(1.0, dtype=torch.float32)
 
     if resume_training:
         latest_ckpt = _find_latest_checkpoint_for_seed(seed)
@@ -143,37 +155,72 @@ def train_model(
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = int(checkpoint.get('epoch', 0))
-            best_val_mse_c = float(checkpoint.get('best_val_mse_c', best_val_mse_c))
+            best_val_mae_c = float(checkpoint.get('best_val_mae_c', best_val_mae_c))
+            alpha_state = torch.tensor(float(checkpoint.get('alpha_state', 1.0)), dtype=torch.float32)
             print(f'已恢复训练: checkpoint={os.path.basename(latest_ckpt)}, start_epoch={start_epoch}')
 
     train_losses_scaled = []
+    train_physics_losses = []
     val_losses_scaled = []
-    val_mse_c_list = []
+    val_mae_c_list = []
+    alpha_history = []
+
+    pinn_params = [param for param in model.parameters() if param.requires_grad]
 
     for local_epoch in range(1, epochs + 1):
         global_epoch = start_epoch + local_epoch
         train_running_loss = 0.0
+        train_running_physics_loss = 0.0
         val_running_loss = 0.0
         val_preds_scaled = []
         val_targets_scaled = []
 
         model.train()
-        for batch_x, batch_y in train_loader:
-            batch_x = batch_x.to(device)
+        for batch in train_loader:
+            batch_x, batch_y, batch_current, batch_voltage, batch_ambient, _, batch_soc, batch_soh = batch
+            batch_x = batch_x.to(device).requires_grad_(True)
             batch_y = batch_y.to(device).view(-1, 1)
+            batch_current = batch_current.to(device).view(-1, 1)
+            batch_voltage = batch_voltage.to(device).view(-1, 1)
+            batch_ambient = batch_ambient.to(device).view(-1, 1)
+            batch_soc = batch_soc.to(device).view(-1, 1)
+            batch_soh = batch_soh.to(device).view(-1, 1)
 
-            output = model(batch_x)
-            loss = criterion(output, batch_y)
+            with torch.backends.cudnn.flags(enabled=False):
+                output_scaled, ocv_hat = model(batch_x, soc=batch_soc, soh=batch_soh, return_aux=True)
+                loss_r = criterion(output_scaled, batch_y)
+
+                temp_grad = torch.autograd.grad(
+                    output_scaled.sum(),
+                    batch_x,
+                    create_graph=True,
+                    retain_graph=True,
+                )[0][:, -1, TIME_FEATURE_INDEX:TIME_FEATURE_INDEX + 1]
+            dtemp_dt = temp_grad * (y_range / time_range)
+
+            output_c = output_scaled * y_range + float(y_scaler.data_min_[0])
+            residual = (
+                dtemp_dt
+                + model.lambda_1 * (batch_voltage - ocv_hat) * batch_current
+                + model.lambda_2 * (batch_ambient - output_c)
+            )
+            loss_f = torch.mean(residual.pow(2))
+
+            alpha_state = _compute_alpha(loss_r, loss_f, pinn_params, alpha_state.to(device))
+            total_loss = loss_r + alpha_state * loss_f
 
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
+            clip_grad_norm_(model.parameters(), max_norm=config.grad_clip_max_norm)
             optimizer.step()
 
-            train_running_loss += loss.item()
+            train_running_loss += loss_r.item()
+            train_running_physics_loss += loss_f.item()
 
         model.eval()
         with torch.no_grad():
-            for v_batch_x, v_batch_y in val_loader:
+            for v_batch in val_loader:
+                v_batch_x, v_batch_y, _, _, _, _, _, _ = v_batch
                 v_batch_x = v_batch_x.to(device)
                 v_batch_y = v_batch_y.to(device).view(-1, 1)
 
@@ -185,29 +232,33 @@ def train_model(
                 val_targets_scaled.append(v_batch_y.cpu().numpy())
 
         train_avg_loss_scaled = train_running_loss / len(train_loader)
+        train_avg_physics_loss = train_running_physics_loss / len(train_loader)
         val_avg_loss_scaled = val_running_loss / len(val_loader)
 
         val_preds_scaled = np.concatenate(val_preds_scaled, axis=0)
         val_targets_scaled = np.concatenate(val_targets_scaled, axis=0)
         val_preds_c = y_scaler.inverse_transform(val_preds_scaled)
         val_targets_c = y_scaler.inverse_transform(val_targets_scaled)
-        val_mse_c = float(np.mean((val_preds_c - val_targets_c) ** 2))
+        val_mae_c = float(np.mean(np.abs(val_preds_c - val_targets_c)))
 
         train_losses_scaled.append(train_avg_loss_scaled)
+        train_physics_losses.append(train_avg_physics_loss)
         val_losses_scaled.append(val_avg_loss_scaled)
-        val_mse_c_list.append(val_mse_c)
+        val_mae_c_list.append(val_mae_c)
+        alpha_history.append(float(alpha_state.item()))
 
-        if val_mse_c < best_val_mse_c:
-            best_val_mse_c = val_mse_c
+        if val_mae_c < best_val_mae_c:
+            best_val_mae_c = val_mae_c
             torch.save(model.state_dict(), best_model_path)
-            print(f'本次最优更新(seed={seed}): epoch={global_epoch}, val_mse_c={best_val_mse_c:.6f}')
+            print(f'本次最优更新(seed={seed}): epoch={global_epoch}, best_val_mae_c={best_val_mae_c:.6f}')
 
         torch.save(
             {
                 'epoch': global_epoch,
                 'seed': seed,
                 'run_id': run_id,
-                'best_val_mse_c': best_val_mse_c,
+                'best_val_mae_c': best_val_mae_c,
+                'alpha_state': float(alpha_state.item()),
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
@@ -216,24 +267,28 @@ def train_model(
         )
 
         prev_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_mse_c)
+        scheduler.step(val_mae_c)
         current_lr = optimizer.param_groups[0]['lr']
         if current_lr < prev_lr:
             print(f'学习率衰减触发(seed={seed}): {prev_lr:.6f} -> {current_lr:.6f}')
 
         if global_epoch % 5 == 0:
             print(
-                f'Seed:{seed} Epoch:{global_epoch} '
+                f'Epoch:{global_epoch} '
                 f'train_loss_scaled:{train_avg_loss_scaled:.6f} '
+                f'train_loss_physics:{train_avg_physics_loss:.6f} '
                 f'val_loss_scaled:{val_avg_loss_scaled:.6f} '
-                f'val_mse_c:{val_mse_c:.4f} '
-                f'best_val_mse_c:{best_val_mse_c:.4f} '
+                f'val_mae_c:{val_mae_c:.4f} '
+                f'best_val_mae_c:{best_val_mae_c:.4f} '
+                f'alpha:{alpha_state.item():.4f} '
+                f'lambda_1:{model.lambda_1.item():.4f} '
+                f'lambda_2:{model.lambda_2.item():.4f} '
                 f'lr:{current_lr:.6f}'
             )
 
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(15, 5))
 
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.plot(train_losses_scaled, 'r-', label='train_loss_scaled')
     plt.plot(val_losses_scaled, 'b--', label='val_loss_scaled')
     plt.title(f'Scaled Loss Curve (seed={seed})', fontsize=12)
@@ -242,11 +297,19 @@ def train_model(
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
 
-    plt.subplot(1, 2, 2)
-    plt.plot(val_mse_c_list, 'g-', label='val_mse_c')
-    plt.title(f'Unscaled Loss Curve (seed={seed})', fontsize=12)
+    plt.subplot(1, 3, 2)
+    plt.plot(train_physics_losses, 'm-', label='train_loss_physics')
+    plt.plot(alpha_history, 'c--', label='alpha')
+    plt.title(f'PINN Loss Curve (seed={seed})', fontsize=12)
     plt.xlabel('local epochs', fontsize=11)
-    plt.ylabel('mse (Celsius^2)', fontsize=11)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+
+    plt.subplot(1, 3, 3)
+    plt.plot(val_mae_c_list, 'g-', label='val_mae_c')
+    plt.title(f'Unscaled MAE Curve (seed={seed})', fontsize=12)
+    plt.xlabel('local epochs', fontsize=11)
+    plt.ylabel('mae (Celsius)', fontsize=11)
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend()
 
@@ -261,47 +324,6 @@ def train_model(
     print(f'本次最后断点: {last_checkpoint_path}')
     print(f'train/val 曲线: {curve_path}')
 
-    return {
-        'seed': seed,
-        'best_model_path': best_model_path,
-        'last_checkpoint_path': last_checkpoint_path,
-        'best_val_mse_c': best_val_mse_c,
-        'curve_path': curve_path,
-    }
-
-
-def run_multi_seed(seeds, resume_training=False):
-    print(f'即将运行多种子训练: {seeds}')
-    results = []
-    for seed in seeds:
-        results.append(train_model(seed=seed, resume_training=resume_training))
-
-    print('多种子训练完成，汇总如下:')
-    for item in results:
-        print(
-            f"seed={item['seed']} best_val_mse_c={item['best_val_mse_c']:.6f} "
-            f"best_model={item['best_model_path']}"
-        )
-
-
-def _parse_args():
-    parser = argparse.ArgumentParser(description='Train model with single seed or multiple seeds.')
-    parser.add_argument(
-        '--seeds',
-        type=int,
-        nargs='*',
-        default=None,
-        help='可选，多种子列表，例如: --seeds 42 123 2024',
-    )
-    parser.add_argument(
-        '--resume_training',
-        action='store_true',
-        help='按种子恢复最近 last_checkpoint_seed{seed}_*.pth 继续训练',
-    )
-    return parser.parse_args()
-
 
 if __name__ == '__main__':
-    args = _parse_args()
-    seeds = _resolve_seeds(args.seeds)
-    run_multi_seed(seeds=seeds, resume_training=args.resume_training)
+    train_model(seed=config.seed, resume_training=False)
